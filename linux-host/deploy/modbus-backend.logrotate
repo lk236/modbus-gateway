@@ -1,0 +1,47 @@
+# =============================================================================
+# modbus-backend — logrotate 日志轮转配置
+#
+# 【为什么需要它】
+#   程序 7×24 跑着，日志文件会无限增长，最后把磁盘写满导致系统故障。
+#   logrotate 是 Linux 自带的日志轮转工具（由 cron/定时器每天触发一次），
+#   按策略把旧日志改名归档、压缩、删掉太老的，控制磁盘占用。
+#
+# 安装:
+#   sudo cp deploy/modbus-backend.logrotate /etc/logrotate.d/modbus-backend
+#   sudo logrotate -d /etc/logrotate.d/modbus-backend   # 调试模式（-d=dry run 只打印不执行）
+#   sudo logrotate -f /etc/logrotate.d/modbus-backend   # 强制执行一次（-f=force）
+#
+# 轮转策略:
+#   - 按天轮转（daily）
+#   - 保留最近 30 份历史日志
+#   - 旧日志 gzip 压缩
+#   - 延迟一天压缩（当前文件保留为纯文本方便 tail）
+#   - 使用 copytruncate（不中断进程写入）
+#   - 文件名加日期后缀（如 modbus-backend.log-20250101.gz）
+# =============================================================================
+
+# 被管理的日志文件绝对路径。
+# 注意：必须与 systemd 的 WorkingDirectory 拼出来的实际路径一致，
+# 否则 logrotate 会报 "cannot stat" 什么都不做（这是最常见的踩坑点）。
+/var/lib/modbus-backend/data/modbus-backend.log {
+    daily            # 每天轮转一次（也可用 weekly/monthly/size=100M）
+    rotate 30        # 保留最近 30 个归档，第 31 个起自动删除
+    compress         # 归档文件用 gzip 压缩，省大量磁盘
+    delaycompress    # 延迟一轮再压缩：这样"昨天的"日志仍是可直接 tail 的纯文本，
+                     # 排查问题时不用先解压
+    missingok        # 日志文件不存在也不报错（服务还没启动过的情况）
+    notifempty       # 日志为空就不轮转，避免产生一堆 0 字节归档
+    # copytruncate：先"复制"原文件内容到新归档，再把原文件截断为 0。
+    # 这样进程手里的文件描述符依然有效，可以继续写 —— 无需通知程序重开文件。
+    # 它的代价是复制与截断之间若有日志写入，可能丢极少量日志；
+    # 替代方案是 postrotate 里发信号让程序重新打开日志，但本程序未实现该信号，
+    # 所以用 copytruncate 是最省事且安全的选择。
+    copytruncate
+    dateext                      # 归档名用日期后缀，而不是默认的 .1 .2 递增序号
+    dateformat -%Y%m%d           # 日期格式，例如 modbus-backend.log-20250101.gz
+
+    # 轮转后可选执行脚本（本项目未启用，因为 copytruncate 已够用）
+    # postrotate
+    #     /bin/kill -HUP $(cat /var/run/modbus-backend.pid 2>/dev/null) 2>/dev/null || true
+    # endscript
+}

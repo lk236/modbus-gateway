@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     dashboard.html — Modbus 多网关监控仪表盘（纯前端，无构建步骤）
+
+     【它怎么和后端配合】
+       这是一个单页应用，被 http_server.c 当作静态文件返回给浏览器。
+       页面本身不含业务逻辑，只是"定时拉取 + 渲染"：
+
+         setInterval(10s) ─┬─→ GET /api/latest              → 渲染网关卡片 + 状态栏时间
+                           ├─→ GET /api/history?gateway&hours → 渲染温度/湿度折线图
+                           └─→ GET /api/alarms?status=active  → 渲染告警徽标 + 告警面板
+
+       三个请求用 Promise.all 并发发出，任一失败不影响另外两个。
+
+     【三个 JSON 接口用到的字段】
+       /api/latest  → { gateways: [ {gateway_id, gateway_name, temperature, humidity, ts} ] }
+       /api/history → { records:  [ {gateway_id, gateway_name, ts, temperature, humidity} ] }
+       /api/alarms  → { active_count, alarms: [ {gateway_id, gateway_name, alarm_type,
+                                                threshold_value, trigger_value, trigger_ts, status} ] }
+
+     【阅读顺序建议】
+       1. 看 <body> 里的结构（header / 卡片区 / 告警面板 / 图表区 / footer）
+       2. 看 JS 的 refreshAll() —— 它是唯一的驱动入口，其余函数都是它的下游
+       3. 再看 renderCards / renderChart / renderAlarms 三个渲染函数
+
+     【为什么用 Chart.js】
+       折线图要处理坐标轴、双 Y 轴（温度/湿度量纲不同）、图例、缩放，手写 canvas
+       工作量太大。Chart.js 是一个 UMD 单文件，直接 <script> 引进来就能用，
+       适合这种"不想上构建工具链"的嵌入式配套页面。见 vendor/chart.umd.min.js。
+     ============================================================================= -->
+<html lang="zh-CN" data-page-node-id="w1OD1NqrBkM7aAB4WUqAsL">
+<head data-page-node-id="r6ijUlYH2jCPUUw1tf6drN">
+<meta charset="UTF-8" data-page-node-id="SyO58ZLBqkIryRHeeP41SU">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" data-page-node-id="N6kXZKGNt4UGAAePOD85ul">
+<title>Modbus 多网关监控</title>
+<!-- Chart.js：本地 vendor 目录自带一份，不依赖 CDN（内网/离线环境也能用） -->
+<script src="vendor/chart.umd.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* 锁定视口，永不滚动：仪表盘是"一屏看全"的大屏场景，
+   所以用 height:100vh + overflow:hidden，让布局自适应而不出现滚动条 */
+html, body {
+  height: 100vh; overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #0f172a; color: #e2e8f0;   /* 深色底 + 浅色字，适合长时间盯屏 */
+}
+body {
+  display: flex; flex-direction: column;  /* 纵向排列：头部/卡片/告警/图表/页脚 */
+  padding: 12px 20px;
+}
+
+/* 顶部标题栏（flex-shrink:0 = 不参与压缩，高度固定） */
+.header { display: flex; align-items: center; gap: 16px; flex-shrink: 0; margin-bottom: 10px; }
+h1 { font-size: 1.2rem; color: #38bdf8; white-space: nowrap; }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
+select, button {
+  background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+  padding: 6px 12px; border-radius: 6px; font-size: 0.85rem; cursor: pointer;
+  white-space: nowrap;
+}
+select:hover, button:hover { border-color: #38bdf8; }   /* 悬停高亮，提示可交互 */
+
+/* 网关卡片区 — 固定高度，不滚动
+   grid + auto-fill/minmax(200px,1fr)：窗口宽就多排几列，窄了就少排，
+   每列最小 200px，卡片自动均分剩余宽度（响应式，无需媒体查询） */
+.gateway-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+  max-height: 130px;      /* 卡片区最高 130px，网关太多也不会挤占图表区 */
+  overflow: hidden;
+}
+.card {
+  background: #1e293b; border: 1px solid #334155; border-radius: 10px;
+  padding: 12px 14px; cursor: pointer; transition: border-color 0.2s;
+  display: flex; flex-direction: column; justify-content: center;
+}
+.card:hover { border-color: #38bdf8; }
+.card .name {
+  font-size: 0.9rem; font-weight: 600; color: #f1f5f9; margin-bottom: 4px;
+  display: flex; align-items: center; gap: 6px;
+}
+/* 在线/离线状态小圆点：绿色在线、红色离线（box-shadow 做发光效果） */
+.card .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.card .status-dot.online { background: #22c55e; box-shadow: 0 0 5px #22c55e88; }
+.card .status-dot.offline { background: #ef4444; box-shadow: 0 0 5px #ef444488; }
+.card .value-row { display: flex; align-items: baseline; gap: 12px; }   /* baseline 让数字底对齐 */
+.card .temp { font-size: 1.6rem; font-weight: 700; color: #f97316; }    /* 温度橙 */
+.card .temp span { font-size: 0.85rem; color: #94a3b8; }                /* 单位 °C 弱化显示 */
+.card .hum { font-size: 1.1rem; color: #38bdf8; }                       /* 湿度蓝 */
+.card .last-time { font-size: 0.7rem; color: #64748b; margin-top: 2px; }
+
+/* 图表容器 — 填满剩余空间（flex:1 吃掉卡片和页脚之外的全部高度）
+   min-height:0 是 flex 布局的经典坑：不加它，子元素 canvas 撑不下时会溢出父容器 */
+.chart-container {
+  background: #1e293b; border: 1px solid #334155; border-radius: 10px;
+  padding: 12px 16px;
+  flex: 1;
+  display: flex; flex-direction: column;
+  min-height: 0;
+}
+.chart-container h2 {
+  font-size: 0.9rem; color: #94a3b8; margin-bottom: 8px; flex-shrink: 0;
+}
+.chart-wrapper {
+  flex: 1;
+  position: relative;   /* Chart.js 的 responsive 模式要求父元素有定位上下文 */
+  min-height: 0;
+}
+/* !important 是为了压过 Chart.js 给自己加的行内宽高，让它老老实实填满容器 */
+canvas { display: block; width: 100% !important; height: 100% !important; }
+
+.error-msg { color: #f87171; text-align: center; padding: 10px; }
+#statusBar { color: #64748b; font-size: 0.8rem; margin-left: auto; white-space: nowrap; }  /* margin-left:auto 把它推到最右 */
+
+/* 告警区域 */
+.alarm-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 0.8rem; color: #fbbf24; cursor: pointer; white-space: nowrap; margin-left: 8px;
+}
+.alarm-badge.has-alarm { color: #f87171; font-weight: 700; }   /* 有告警时变红加粗 */
+.alarm-panel {
+  background: #1e293b; border: 1px solid #7f1d1d; border-radius: 8px;
+  margin-bottom: 8px; flex-shrink: 0; overflow: hidden;
+  display: none;                 /* 默认折叠，加 .active 才展开 */
+}
+.alarm-panel.active { display: block; }
+.alarm-panel-header {
+  display: flex; align-items: center; gap: 8px; padding: 6px 14px;
+  background: #2d1b1b; cursor: pointer; user-select: none;   /* 禁止选中文字，像按钮 */
+  font-size: 0.85rem; color: #fca5a5;
+}
+.alarm-panel-header:hover { background: #3d2222; }
+.alarm-panel-body { max-height: 160px; overflow-y: auto; padding: 4px 0; }  /* 条目多时内部滚动 */
+.alarm-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 14px; font-size: 0.8rem; border-bottom: 1px solid #1e293b;
+  transition: background 0.2s;
+}
+.alarm-item:last-child { border-bottom: none; }
+.alarm-item:hover { background: #1a2332; }
+.alarm-icon { font-size: 1rem; flex-shrink: 0; }
+.alarm-gw { color: #f1f5f9; font-weight: 600; min-width: 80px; }     /* min-width 让各列对齐 */
+.alarm-type { color: #f87171; min-width: 80px; }
+.alarm-val { color: #94a3b8; }
+.alarm-time { color: #64748b; margin-left: auto; white-space: nowrap; font-size: 0.75rem; }
+.alarm-item.recovered { opacity: 0.5; }                              /* 已恢复的置灰 */
+.alarm-item.recovered .alarm-type { color: #4ade80; }                /* 类型文字转绿 */
+
+footer { flex-shrink: 0; text-align: center; color: #475569; font-size: 0.7rem; padding-top: 6px; }
+</style>
+</head>
+<body data-page-node-id="tbwZvKnVraMVVs5FY4KHWT">
+
+<!-- 顶部：标题 + 两个下拉框 + 手动刷新 + 状态栏 + 告警徽标 -->
+<div class="header" data-page-node-id="fOBhfO4W1AfO8VqdfDLUSr">
+  <h1 data-page-node-id="TjP57B6PLahIUtIFRxElwT">🔌 Modbus 多网关</h1>
+  <div class="controls" data-page-node-id="4uCqNxNjtNPnPA9aYAvdmC">
+    <!-- gatewaySelect 的选项由 JS 动态填充（见 updateGatewaySelect）；-1 = 全部 -->
+    <select id="gatewaySelect" data-page-node-id="b2SMCoWAfQ9ZOz3XpB4foh"><option value="-1" data-page-node-id="mAHGWGpoZkaAVCjH4iUUQe">所有</option></select>
+    <!-- hoursSelect 控制折线图回看时长，默认选中 24h -->
+    <select id="hoursSelect" data-page-node-id="EGTvqO1j7RjTgOF3mzBhAx">
+      <option value="1" data-page-node-id="VkuuhgH1zHy9ITxszXDrRa">1h</option>
+      <option value="6" data-page-node-id="hzOJs8AqIUbEPHCHaYLuog">6h</option>
+      <option value="24" selected data-page-node-id="U6xQw4lG2BuGamjPAMM6YP">24h</option>
+      <option value="72" data-page-node-id="CJbLNF3ZS0Yxl24xbUD97S">3d</option>
+      <option value="168" data-page-node-id="vDOw5RzYAPO2CM86ywaJJ5">7d</option>
+    </select>
+    <button onclick="refreshAll()" data-page-node-id="01rBFB1qyCWrBeGGo4dVw3">🔄</button>
+  </div>
+  <span id="statusBar" data-page-node-id="MPjdhc3ef3gBdvUg2Ibm1y"></span>
+  <span id="alarmBadge" class="alarm-badge" onclick="toggleAlarmPanel()" data-page-node-id="3kO2Rk8m4N0cnKvBFgAoCo"></span>
+</div>
+
+<!-- 网关卡片区：内容由 renderCards() 生成 -->
+<div id="gatewayCards" class="gateway-cards" data-page-node-id="OkQKX5Ith26jHr49IKFKHl"></div>
+
+<!-- 告警面板：折叠式，点标题栏或徽标切换展开/收起 -->
+<div id="alarmPanel" class="alarm-panel" data-page-node-id="wUm8iu6Iwq3PuC7X8X2bQF">
+  <div class="alarm-panel-header" onclick="toggleAlarmPanel()" data-page-node-id="zglwmi5g4Lzr42TlqSblhS">
+    <span data-page-node-id="8eZZ6u7g3DYb007jFBjUHK">🚨</span>
+    <span id="alarmPanelTitle" data-page-node-id="Ec8yE0QuKmrmUnRtxwfjDW">告警列表</span>
+    <span style="margin-left:auto;font-size:0.75rem;" data-page-node-id="f24FipatUaC66GcDSgsgPD">点击收起 ▴</span>
+  </div>
+  <div id="alarmBody" class="alarm-panel-body" data-page-node-id="liXRGV2xuNYYJY8tytCB2r"></div>
+</div>
+
+<!-- 图表区：Chart.js 把折线画在这个 canvas 上 -->
+<div class="chart-container" data-page-node-id="ERhqa67mT9auJWXcRvfcHy">
+  <h2 data-page-node-id="qjRTH8sBl2CLvjLoPOBAhd">📈 温度 / 湿度</h2>
+  <div class="chart-wrapper" data-page-node-id="iEvW4P9G8rVuib5ErinqmC">
+    <canvas id="historyChart" data-page-node-id="ulUsCxsFZmpTcN26i6F1M9"></canvas>
+  </div>
+</div>
+
+<footer data-page-node-id="DGWyLnZEtvBFJ1vqPf6jwM">Modbus Multi-Gateway Monitor · HTTP API on :8080</footer>
+
+<script>
+const API_BASE = '';        // 空串 = 同源（页面和后端都是 8080 端口），无需写完整 URL
+let chart = null;           // 保存当前 Chart 实例，重建前必须先 destroy 否则内存泄漏
+let autoRefreshId = null;   // setInterval 的句柄，用于停止自动刷新
+
+/* 自动刷新：每 10 秒拉一次全部数据。
+   先 stop 再 start，保证不会重复注册多个定时器（否则越点越快） */
+function startAutoRefresh() {
+  stopAutoRefresh();
+  autoRefreshId = setInterval(refreshAll, 10000);
+}
+function stopAutoRefresh() {
+  if (autoRefreshId) { clearInterval(autoRefreshId); autoRefreshId = null; }
+}
+
+/* ---- 最新数据：拉 /api/latest 并渲染卡片，同时刷新下拉框和时间戳 ---- */
+async function refreshCards() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/latest`);
+    const data = await resp.json();
+    renderCards(data);
+    updateGatewaySelect(data);
+    document.getElementById('statusBar').textContent =
+      new Date().toLocaleTimeString('zh-CN');    // 右上角显示"最后更新时间"
+  } catch (e) {
+    // 后端挂了/网络不通：把错误显示在状态栏，而不是抛到控制台让人看不见
+    document.getElementById('statusBar').textContent = '⚠️ ' + e.message;
+  }
+}
+
+/* 渲染网关卡片：一段 HTML 字符串拼好后一次性 innerHTML，比逐个 append 快 */
+function renderCards(data) {
+  const container = document.getElementById('gatewayCards');
+  if (!data.gateways || data.gateways.length === 0) {
+    container.innerHTML = '<div class="error-msg">暂无数据</div>';
+    return;
+  }
+  let html = '';
+  for (const gw of data.gateways) {
+    const ts = new Date(gw.ts * 1000);            // 后端 ts 是秒级 Unix 时间，×1000 转毫秒
+    const timeStr = ts.toLocaleString('zh-CN');
+    // 用"温度字段是否存在"判断在线：离线时后端不下发 temperature/humidity
+    const online = gw.temperature !== undefined;
+    // esc() 做 HTML 转义，防止网关名里的特殊字符破坏页面结构（XSS 防护）
+    html += `
+      <div class="card" onclick="selectGateway(${gw.gateway_id})">
+        <div class="name">
+          <span class="status-dot ${online ? 'online' : 'offline'}"></span>
+          ${esc(gw.gateway_name || 'GW-' + gw.gateway_id)}
+        </div>
+        <div class="value-row">
+          <div class="temp">${online ? gw.temperature.toFixed(1) : '--'}<span>°C</span></div>
+          <div class="hum">${online ? gw.humidity.toFixed(1) : '--'}%</div>
+        </div>
+        <div class="last-time">${timeStr}</div>
+      </div>`;
+  }
+  container.innerHTML = html;
+}
+
+/* 同步下拉框选项：保留用户当前选择（cur），网关增删后也要维持住 */
+function updateGatewaySelect(data) {
+  const sel = document.getElementById('gatewaySelect');
+  const cur = sel.value;                                  // 记下当前选中项
+  sel.innerHTML = '<option value="-1">所有</option>';     // 清空并重建
+  if (data.gateways) {
+    for (const gw of data.gateways) {
+      const opt = document.createElement('option');
+      opt.value = gw.gateway_id;
+      opt.textContent = gw.gateway_name || 'GW-' + gw.gateway_id;
+      sel.appendChild(opt);
+    }
+  }
+  // 如果原来的选中项还在新列表里，就恢复它（否则自动落回"所有"）
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+}
+
+/* ---- 历史折线图：拉 /api/history 并重建图表 ---- */
+async function refreshChart() {
+  const gatewayId = document.getElementById('gatewaySelect').value;  // -1=全部
+  const hours = document.getElementById('hoursSelect').value;
+  try {
+    const resp = await fetch(`${API_BASE}/api/history?gateway=${gatewayId}&hours=${hours}`);
+    const data = await resp.json();
+    renderChart(data);
+  } catch (e) { console.error(e); }
+}
+
+/* ---- 网关颜色盘：每个网关一对颜色（温度实线/湿度虚线），循环复用 ---- */
+const GW_COLORS = [
+  { temp: '#f97316', hum: '#38bdf8' },   /* GW1: 橙/蓝 */
+  { temp: '#22c55e', hum: '#86efac' },   /* GW2: 绿/浅绿 */
+  { temp: '#a855f7', hum: '#c084fc' },   /* GW3: 紫/浅紫 */
+  { temp: '#eab308', hum: '#fde047' },   /* GW4: 黄/浅黄 */
+  { temp: '#ec4899', hum: '#f472b6' },   /* GW5: 粉/浅粉 */
+  { temp: '#06b6d4', hum: '#67e8f9' },   /* GW6: 青/浅青 */
+  { temp: '#ef4444', hum: '#f87171' },   /* GW7: 红/浅红 */
+  { temp: '#14b8a6', hum: '#5eead4' },   /* GW8: 翡翠/浅翡翠 */
+];
+
+function renderChart(data) {
+  const canvas = document.getElementById('historyChart');
+  const ctx = canvas.getContext('2d');
+
+  // 无数据：销毁旧图，改用 canvas 原生 API 居中写一句"暂无数据"
+  if (!data.records || data.records.length === 0) {
+    if (chart) { chart.destroy(); chart = null; }
+    const rect = canvas.parentElement.getBoundingClientRect();
+    ctx.fillStyle = '#64748b';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('暂无数据', rect.width / 2, rect.height / 2);
+    return;
+  }
+
+  // 重建前必须销毁旧实例：Chart.js 各实例共用 canvas，不销毁会叠加/泄漏
+  if (chart) { chart.destroy(); }
+
+  const gatewayId = parseInt(document.getElementById('gatewaySelect').value);
+  const isAll = (gatewayId === -1);   // -1 表示"所有网关"视图
+
+  let labels, datasets;
+
+  if (isAll) {
+    /* ---- 所有网关：按 gateway_id 分组，每个网关一对曲线（温度+湿度） ---- */
+    const groups = {};
+    for (const r of data.records) {
+      const gid = r.gateway_id;
+      if (gid === undefined) continue;
+      // 首次遇到该网关时建组；name 取记录里带的网关名
+      if (!groups[gid]) groups[gid] = { name: r.gateway_name || 'GW-' + gid, records: [] };
+      groups[gid].records.push(r);
+    }
+
+    /* 所有时间戳取并集作为 x 轴标签。
+       为什么用"并集"：各网关采集时刻不完全相同，直接拿某个网关的时间轴会导致
+       另一个网关的数据对不上点。用 Set 去重 + 排序，得到统一时间轴。 */
+    const tsSet = new Set(data.records.map(r => r.ts));
+    const sortedTs = Array.from(tsSet).sort((a, b) => a - b);
+    labels = sortedTs.map(ts => {
+      const d = new Date(ts * 1000);
+      return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    });
+
+    datasets = [];
+    const gids = Object.keys(groups).map(Number).sort((a, b) => a - b);   // 按 id 排序，颜色稳定
+    for (let ci = 0; ci < gids.length; ci++) {
+      const gid = gids[ci];
+      const group = groups[gid];
+      const color = GW_COLORS[ci % GW_COLORS.length];   // 取模，超过 8 个网关就循环配色
+
+      /* 建立 ts→record 查找表：把"每个时间点"映射到该网关的记录，
+         这样在统一时间轴上取值就是 O(1)（否则要双层遍历，数据量大时很慢） */
+      const map = {};
+      for (const r of group.records) map[r.ts] = r;
+
+      /* 温度曲线（走左轴 y） */
+      datasets.push({
+        label: group.name + ' 温度',
+        // 该时间点没有数据就填 null，配合 spanGaps:true 让曲线跨过这个空档继续画
+        data: sortedTs.map(ts => map[ts] !== undefined ? map[ts].temperature : null),
+        borderColor: color.temp,
+        backgroundColor: color.temp + '22',   // 末尾加 '22' = 约 13% 透明度（ARGB 十六进制）
+        fill: false,                          // 全部视图下不填充，否则多条曲线会糊成一片
+        tension: 0.3,                         // 0=折线，1=圆滑曲线
+        pointRadius: 0.5,                     // 数据点画得极小，只看趋势不看点
+        borderWidth: 1.5,
+        spanGaps: true,
+        yAxisID: 'y',                         // 对应下方 scales.y（温度轴）
+      });
+      /* 湿度曲线（走右轴 y1，虚线区分） */
+      datasets.push({
+        label: group.name + ' 湿度',
+        data: sortedTs.map(ts => map[ts] !== undefined ? map[ts].humidity : null),
+        borderColor: color.hum,
+        backgroundColor: color.hum + '22',
+        fill: false,
+        tension: 0.3,
+        pointRadius: 0.5,
+        borderWidth: 1.5,
+        borderDash: [3, 3],                   // 虚线：3 像素实、3 像素空
+        spanGaps: true,
+        yAxisID: 'y1',                        // 对应 scales.y1（湿度轴）
+      });
+    }
+  } else {
+    /* ---- 单个网关：只显示该网关数据，温湿度各自填充便于对比 ---- */
+    const gwName = data.gateway_name || 'GW-' + gatewayId;
+    labels = data.records.map(r => {
+      const d = new Date(r.ts * 1000);
+      return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    });
+    datasets = [
+      {
+        label: gwName + ' 温度',
+        data: data.records.map(r => r.temperature),
+        borderColor: '#f97316',
+        backgroundColor: '#f9731622',
+        fill: true,        // 单网关视图下填充，视觉上更饱满
+        tension: 0.3,
+        pointRadius: 0.5,
+        borderWidth: 1.5,
+        yAxisID: 'y',
+      },
+      {
+        label: gwName + ' 湿度',
+        data: data.records.map(r => r.humidity),
+        borderColor: '#38bdf8',
+        backgroundColor: '#38bdf822',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0.5,
+        borderWidth: 1.5,
+        yAxisID: 'y1',
+      }
+    ];
+  }
+
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,   // 必须 false，否则图表按宽高比缩放，填不满容器
+      animation: false,             // 关动画：每 10 秒重绘一次，动画会显得闪烁
+      // 鼠标悬停时按"最近的 x 位置"整体高亮，不要求正好点在数据点上
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#94a3b8', boxWidth: 12, padding: 8, font: { size: 9 } } }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#64748b', maxTicksLimit: 15, font: { size: 10 } },  // 限制刻度数防拥挤
+          grid: { color: '#334155' }
+        },
+        y: {                              // 左轴：温度
+          display: true, position: 'left',
+          min: -10, max: 60,              // 固定量程，避免数据小幅波动时纵轴频繁缩放
+          title: { display: true, text: '°C', color: '#f97316' },
+          ticks: { color: '#f97316', stepSize: 10, font: { size: 10 } },
+          grid: { color: '#334155' }
+        },
+        y1: {                             // 右轴：湿度
+          display: true, position: 'right',
+          min: 0, max: 100,
+          title: { display: true, text: '%RH', color: '#38bdf8' },
+          ticks: { color: '#38bdf8', stepSize: 20, font: { size: 10 } },
+          // drawOnChartArea:false → 右轴不画网格线，否则和左轴网格重叠显得乱
+          grid: { drawOnChartArea: false }
+        }
+      }
+    }
+  });
+}
+
+/* 点卡片 = 把下拉框切到该网关并立即重画（无需等下一次自动刷新） */
+function selectGateway(id) {
+  document.getElementById('gatewaySelect').value = id;
+  refreshChart();
+}
+
+/* 统一入口：三个数据源并发拉取，等全部完成（Promise.all）。
+   任何一路失败都会被各自的 try/catch 吞掉，不会连累其它两路。 */
+async function refreshAll() {
+  await Promise.all([refreshCards(), refreshChart(), refreshAlarms()]);
+}
+
+/* ---- 告警类型中文映射（后端下发的是英文枚举，这里转成带图标的文案） ---- */
+const ALARM_LABELS = {
+  temp_high: '🌡️ 温度过高', temp_low: '🌡️ 温度过低',
+  hum_high: '💧 湿度过高', hum_low: '💧 湿度过低'
+};
+
+/* ---- 告警 ---- */
+let alarmPanelOpen = false;    // 面板展开状态（与 DOM 的 .active 类保持同步）
+
+function toggleAlarmPanel() {
+  alarmPanelOpen = !alarmPanelOpen;
+  document.getElementById('alarmPanel').classList.toggle('active', alarmPanelOpen);
+}
+
+async function refreshAlarms() {
+  try {
+    // status=active 只要活跃告警；limit=20 最多 20 条（避免告警风暴时页面卡死）
+    const resp = await fetch(`${API_BASE}/api/alarms?status=active&limit=20`);
+    const data = await resp.json();
+    renderAlarms(data);
+  } catch (e) {
+    console.error('Alarms fetch error:', e);   // 告警拉取失败不影响主视图，只记日志
+  }
+}
+
+function renderAlarms(data) {
+  const badge = document.getElementById('alarmBadge');
+  const count = data.active_count || 0;
+  // 更新徽标：有告警变红加粗，无告警保持普通样式
+  if (count > 0) {
+    badge.textContent = `🔔 ${count} 条告警`;
+    badge.classList.add('has-alarm');
+    document.getElementById('alarmPanelTitle').textContent = `🚨 活跃告警 (${count})`;
+  } else {
+    badge.textContent = '🔔 无告警';
+    badge.classList.remove('has-alarm');
+    document.getElementById('alarmPanelTitle').textContent = '✅ 无活跃告警';
+  }
+
+  const body = document.getElementById('alarmBody');
+  if (!data.alarms || data.alarms.length === 0) {
+    body.innerHTML = '<div style="padding:12px;text-align:center;color:#64748b;font-size:0.8rem;">当前无活跃告警</div>';
+    return;
+  }
+
+  let html = '';
+  for (const a of data.alarms) {
+    const ts = new Date(a.trigger_ts * 1000);
+    const timeStr = ts.toLocaleString('zh-CN');
+    const typeLabel = ALARM_LABELS[a.alarm_type] || a.alarm_type;   // 映射不到就原样显示
+    const icon = a.status === 'recovered' ? '✅' : '🚨';            // 已恢复 vs 活跃
+    html += `
+      <div class="alarm-item ${a.status === 'recovered' ? 'recovered' : ''}">
+        <span class="alarm-icon">${icon}</span>
+        <span class="alarm-gw">${esc(a.gateway_name || 'GW-' + a.gateway_id)}</span>
+        <span class="alarm-type">${typeLabel}</span>
+        <span class="alarm-val">阈值 ${a.threshold_value} · 触发值 ${a.trigger_value}</span>
+        <span class="alarm-time">${timeStr}</span>
+      </div>`;
+  }
+  body.innerHTML = html;
+
+  /* 有活跃告警时自动展开面板（只在"当前是收起状态"时展开，不打扰用户的主动收起操作） */
+  if (count > 0 && !alarmPanelOpen) {
+    alarmPanelOpen = true;
+    document.getElementById('alarmPanel').classList.add('active');
+  }
+}
+
+/* HTML 转义工具：借助浏览器自身能力——把字符串塞进 div 的 textContent，
+   再读 innerHTML。此时 & < > 等已被自动转义成实体，等价于一个安全的 escape()。
+   比手写 replace 链更可靠（能处理所有实体情况）。*/
+function esc(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+/* 事件绑定：切换下拉框 → 重画图；窗口缩放 → 重画图（Chart.js 自适应） */
+document.getElementById('gatewaySelect').addEventListener('change', refreshChart);
+document.getElementById('hoursSelect').addEventListener('change', refreshChart);
+window.addEventListener('resize', refreshChart);
+
+/* 页面加载后先拉一次数据，成功后再启动 10 秒定时自动刷新 */
+refreshAll().then(startAutoRefresh);
+</script>
+</body>
+</html>

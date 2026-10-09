@@ -1,0 +1,70 @@
+# =============================================================================
+# modbus-backend.service — Modbus 多网关采集后端 systemd 服务单元
+#
+# 【这个文件是什么】
+#   systemd 是 Linux 的 1 号进程（服务管理器）。写一个 .service 文件放进
+#   /etc/systemd/system/，systemd 就会接管这个程序：开机自启、崩溃自动拉起、
+#   日志统一收进 journald、用 systemctl 一条命令管理启停。
+#   好处是"程序崩了没人管"变成"systemd 5 秒后自动重启"，无人值守部署必备。
+#
+# 安装步骤:
+#   sudo cp deploy/modbus-backend.service /etc/systemd/system/
+#   sudo systemctl daemon-reload          # 让 systemd 重新读取单元文件
+#   sudo systemctl enable --now modbus-backend   # enable=开机自启, --now=立即启动
+#
+# 常用命令:
+#   systemctl status modbus-backend     # 查看状态/最近日志
+#   systemctl restart modbus-backend    # 重启
+#   journalctl -u modbus-backend -f     # 实时看日志（像 tail -f）
+#   kill -HUP $(pidof modbus-backend)   # 热重载配置（无需重启进程）
+# =============================================================================
+
+[Unit]
+# Description: 给人看的一句话说明（systemctl status 里会显示）
+Description=Modbus Multi-Gateway Monitor Backend
+Documentation=https://github.com/example/modbus-backend
+# After: 本服务在网络就绪**之后**再启动（只是排序，不强制依赖）
+# Wants: 弱依赖——希望 network.target 启动，但它失败也不阻止本服务
+After=network.target
+Wants=network.target
+
+[Service]
+# Type=simple：默认类型。systemd 认为 ExecStart 启动的进程就是主进程本身，
+# 启动即视为"服务已就绪"。适用于自己不会 fork 到后台的前台程序（本项目正是）。
+# 对比 Type=forking 用于那些自己 daemonize、父进程退出的老式程序。
+Type=simple
+# 可执行文件路径（make install 后位于 /usr/local/bin）
+# -c 指定配置文件路径；部署到系统目录而不是项目目录，是规范做法
+ExecStart=/usr/local/bin/modbus-backend -c /etc/modbus-backend/config.ini
+# 工作目录。程序里的相对路径（data/xxx.db、data/xxx.log）都相对它解析，
+# 所以数据文件实际落在 /var/lib/modbus-backend/data/
+WorkingDirectory=/var/lib/modbus-backend
+
+# 崩溃自动重启
+# Restart=always：无论正常退出还是崩溃，都重启（无人值守的关键）
+# 想更谨慎可改 on-failure（仅异常退出才重启）
+Restart=always
+RestartSec=5      # 重启前等 5 秒，避免"崩→起→崩"的高频循环打爆日志
+
+# 安全加固（可选）
+# 原理：以普通用户而非 root 运行；禁止提权；给独立的 /tmp
+User=ubuntu           # 改成目标机器上真实存在的普通用户
+Group=ubuntu
+NoNewPrivileges=yes   # 禁止通过 setuid 提权
+PrivateTmp=yes        # 分配私有 /tmp，与系统 /tmp 隔离，降低被利用风险
+
+# 日志输出到 journald
+# StandardOutput/Error=journal：stdout/stderr 都进 systemd 日志，
+# 之后用 journalctl -u modbus-backend 就能看，无需自己重定向到文件
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=modbus-backend   # 日志条目前缀，便于 grep 过滤
+
+# 限制资源
+# LimitNOFILE：最大打开文件数。多网关×多连接时用得上，默认 1024 可能不够
+LimitNOFILE=4096
+
+[Install]
+# WantedBy=multi-user.target：systemctl enable 时把本服务挂到"多用户"目标下，
+# 即普通开机流程会拉起它（类比传统 init 的 runlevel 3/5）
+WantedBy=multi-user.target

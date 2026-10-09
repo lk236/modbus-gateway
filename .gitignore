@@ -1,0 +1,80 @@
+# =============================================================================
+# Modbus 协议转换网关 — Git 忽略规则
+# =============================================================================
+
+# ------------------------------- Keil MDK (stm32-gateway) -------------------
+# 中间产物与输出目录（体积巨大，必须忽略）
+Objects/
+Listings/
+DebugConfig/
+MDK-ARM/*/
+!MDK-ARM/RTE/
+*.o
+*.obj
+*.crf
+*.d
+*.dep
+*.a
+*.axf
+*.hex
+*.bin
+*.htm
+*.lnp
+*.sct
+*.lst
+*.map
+*.bak
+
+# 个人窗口布局（含本机用户名，不应上传）
+*.uvguix.*
+
+# 构建日志
+build_log.txt
+*.build_log.htm
+
+# ------------------------------- Bootloader ---------------------------------
+Bootloader/Objects/
+Bootloader/Listings/
+
+# ------------------------------- Linux 上位机 (linux-host) ------------------
+# 编译产物
+obj/
+bin/
+*.d
+
+# 运行时数据（数据库与日志，本地生成）
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.log
+data/*.txt
+
+# 编译进固件的示例产物（由 tools/pack_firmware.py 生成，本地自行打包即可）
+firmware/*.ota
+**/firmware/*.ota
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# ------------------------------- CubeMX -------------------------------------
+# CubeMX 本地工程索引（可选，如不希望上传可保留忽略）
+# .mxproject
+
+# ------------------------------- 通用 ---------------------------------------
+.vscode/
+.idea/
+.trae/
+*.swp
+*~
+
+# 本地工作记录
+.workbuddy/
+
+# 本地整理说明（含清理过程记录，不对外）
+GITHUB上传步骤.md
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
